@@ -1,0 +1,76 @@
+name: Automated Repo Cleanup
+
+on:
+  schedule:
+    # Runs every day at midnight UTC
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+    # Allows you to trigger the cleanup manually from the Actions tab
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # Required to delete files and push changes back
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Fetches all history (required for meaningful git gc)
+
+      - name: Run Age and Space-Based Cleanup
+        env:
+          MAX_AGE_DAYS: 30
+          FREE_LIMIT_MB: 1000 # GitHub's hard limit is 2GB (2000MB). 1GB is a safe buffer.
+          TARGET_DIR: "." # Change to a specific folder if you don't want to scan the whole repo
+        run: |
+          echo "=== Starting Cleanup ==="
+          
+          # 1. Delete files older than 30 days (excluding hidden .git folders)
+          echo "Checking for files older than $MAX_AGE_DAYS days..."
+          find "$TARGET_DIR" -type f -mtime +"$MAX_AGE_DAYS" -not -path '*/.*' -delete
+
+          # 2. Check current repository size in Megabytes
+          CURRENT_SIZE_MB=$(du -sm . | cut -f1)
+          echo "Current repo size: ${CURRENT_SIZE_MB}MB (Free tier limit buffer: ${FREE_LIMIT_MB}MB)"
+
+          # 3. If size is still over the limit, aggressively purge oldest files first
+          if [ "$CURRENT_SIZE_MB" -gt "$FREE_LIMIT_MB" ]; then
+              echo "Warning: Repo size exceeds limit! Purging oldest files..."
+              
+              find "$TARGET_DIR" -type f -not -path '*/.*' -printf '%T+ %p\n' | sort | while read -r line; do
+                  FILE_PATH=$(echo "$line" | cut -d' ' -f2-)
+                  
+                  CURRENT_SIZE_MB=$(du -sm . | cut -f1)
+                  if [ "$CURRENT_SIZE_MB" -le "$FREE_LIMIT_MB" ]; then
+                      echo "Repo size reduced below threshold."
+                      break
+                  fi
+                  
+                  echo "Removing old file to save space: $FILE_PATH"
+                  rm -f "$FILE_PATH"
+              done
+          fi
+
+          # 4. Commit and Force Push History Pruning back to GitHub
+          if [ -n "$(git status --porcelain)" ]; then
+              echo "Staging deletions..."
+              git config --global user.name "github-actions[bot]"
+              git config --global user.email "github-actions[bot]@users.noreply.github.com"
+              
+              git add -A
+              git commit -m "chore: automated cloud space and age-based cleanup [skip ci]"
+              
+              echo "Running aggressive garbage collection..."
+              git reflog expire --expire=now --all
+              git gc --prune=now --aggressive
+              
+              echo "Force pushing pruned history back to GitHub..."
+              # Extracts the current branch name dynamically (e.g. main or master)
+              BRANCH_NAME=${GITHUB_REF##*/}
+              git push origin "$BRANCH_NAME" --force
+          else
+              echo "Repo is clean and within constraints. No action needed."
+          fi
+
